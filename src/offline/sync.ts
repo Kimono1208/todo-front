@@ -55,6 +55,7 @@ export async function syncNow() {
         }
       } catch (err) {
         console.error("Falló el bulksync, abortando limpieza:", err);
+        
         return; // 🛑 Salimos para NO borrar el outbox si el servidor falló
       }
     }

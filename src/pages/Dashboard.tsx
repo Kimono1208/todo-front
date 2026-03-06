@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { useEffect, useMemo, useState } from "react";
 import { api, setAuth } from "../api";
 import {
@@ -8,7 +9,7 @@ import {
   queue,
   type OutboxOp,
 } from "../offline/db";
-import { syncNow, setupOnlineSync } from "../offline/sync";
+import { syncNow } from "../offline/sync";
 
 type Status = "Pendiente" | "En Progreso" | "Completada";
 
@@ -20,7 +21,9 @@ type Task = {
   clienteId?: string;
   createdAt?: string;
   deleted?: boolean;
-  pending?: boolean;           // <- muestra “Falta sincronizar”
+  pending?: boolean;
+  subtasks?: Task[];
+  parentId?: string;
 };
 
 // id local (no 24 hex de Mongo)
@@ -34,15 +37,108 @@ function normalizeTask(x: any): Task {
     description: x?.description ?? "",
     status:
       x?.status === "Completada" ||
-      x?.status === "En Progreso" ||
-      x?.status === "Pendiente"
+        x?.status === "En Progreso" ||
+        x?.status === "Pendiente"
         ? x.status
         : "Pendiente",
     clienteId: x?.clienteId,
     createdAt: x?.createdAt,
     deleted: !!x?.deleted,
     pending: !!x?.pending,
+    parentId: x?.parentId,
   };
+}
+
+interface TaskItemProps {
+  task: Task;
+  allTasks: Task[];
+  onStatusChange: (task: Task, newStatus: Status) => void;
+  onAddSubtask: (parent: Task) => void;
+  onEdit: (task: Task) => void;
+  onRemove: (id: string) => void;
+  onSaveEdit: (id: string) => void;
+  isEditing: boolean;
+  editState: { id: string | null; title: string; description: string };
+  setEditState: (state: any) => void;
+}
+
+function TaskItem({ 
+  task, 
+  allTasks, 
+  onStatusChange, 
+  onAddSubtask, 
+  onEdit, 
+  onRemove, 
+  isEditing, 
+  editState, 
+  setEditState, 
+  onSaveEdit 
+}: TaskItemProps) { // <--- Cambiamos 'any' por 'TaskItemProps'
+  
+  const subtasks = allTasks.filter((t) => t.parentId === task._id);
+
+  return (
+  <li className={task.status === "Completada" ? "item done" : "item"}>
+    {/* Esta es la fila que usa el GRID de 3 columnas */}
+    <div className="item-main-row">
+      <select
+        value={task.status}
+        onChange={(e) => onStatusChange(task, e.target.value as Status)}
+        className="status-select"
+      >
+        <option value="Pendiente">Pendiente</option>
+        <option value="En Progreso">En Progreso</option>
+        <option value="Completada">Completada</option>
+      </select>
+
+      <div className="content">
+        {isEditing ? (
+          <input
+            className="edit"
+            value={editState.title}
+            onChange={e => setEditState({ ...editState, title: e.target.value })}
+            autoFocus
+          />
+        ) : (
+          <span className="title" onDoubleClick={() => onEdit(task)}>{task.title}</span>
+        )}
+      </div>
+
+      <div className="actions">
+        {isEditing ? (
+          <button className="btn" onClick={() => onSaveEdit(task._id)}>S</button>
+        ) : (
+          <>
+            <button className="icon" onClick={() => onAddSubtask(task)}>➕</button>
+            <button className="icon" onClick={() => onEdit(task)}>✏️</button>
+            <button className="icon danger" onClick={() => onRemove(task._id)}>🗑️</button>
+          </>
+        )}
+      </div>
+    </div>
+
+    {/* Las subtareas quedan fuera del Grid principal, por eso ya no se aplastan */}
+    {subtasks.length > 0 && (
+      <ul className="sub-list">
+        {subtasks.map((sub: any) => (
+          <TaskItem
+            key={sub._id}
+            task={sub}
+            allTasks={allTasks}
+            onStatusChange={onStatusChange}
+            onAddSubtask={onAddSubtask}
+            onEdit={onEdit}
+            onRemove={onRemove}
+            onSaveEdit={onSaveEdit}
+            isEditing={editState.id === sub._id}
+            editState={editState}
+            setEditState={setEditState}
+          />
+        ))}
+      </ul>
+    )}
+  </li>
+);
 }
 
 export default function Dashboard() {
@@ -61,7 +157,7 @@ export default function Dashboard() {
     setAuth(localStorage.getItem("token"));
 
     // Suscripción que dispara sync al volver online (definida en offline/sync)
-    const unsubscribe = setupOnlineSync();
+    // const unsubscribe = setupOnlineSync();
 
     // Handlers de estado (sin recargar)
     const on = async () => {
@@ -89,7 +185,7 @@ export default function Dashboard() {
     })();
 
     return () => {
-      unsubscribe?.();
+      //unsubscribe?.();
       window.removeEventListener("online", on);
       window.removeEventListener("offline", off);
     };
@@ -114,6 +210,7 @@ export default function Dashboard() {
     const t = title.trim();
     const d = description.trim();
     if (!t) return;
+
 
     // Crear local inmediatamente
     const clienteId = crypto.randomUUID();
@@ -147,9 +244,66 @@ export default function Dashboard() {
       const { data } = await api.post("/tasks", { title: t, description: d });
       const created = normalizeTask(data?.task ?? data);
       setTasks((prev) => prev.map((x) => (x._id === clienteId ? created : x)));
+      await removeTaskLocal(clienteId);
       await putTaskLocal(created);
     } catch {
       // si falla, encola
+      const op: OutboxOp = {
+        id: "op-" + clienteId,
+        op: "create",
+        clienteId,
+        data: localTask,
+        ts: Date.now(),
+      };
+      await queue(op);
+    }
+  }
+
+  async function addSubtask(parent: Task) {
+    const subTitle = prompt(`Nueva subtarea para: ${parent.title}`);
+
+    // 1. Validar que el usuario escribió algo
+    if (!subTitle || !subTitle.trim()) return;
+
+    const titleValue = subTitle.trim();
+    const clienteId = crypto.randomUUID();
+
+    // 2. Crear el objeto con las variables correctas
+    const localTask = normalizeTask({
+      _id: clienteId,
+      title: titleValue, // Antes tenías 't', por eso fallaba
+      description: "",   // Antes tenías 'd'
+      status: "Pendiente" as Status,
+      parentId: parent._id, // Enlazamos al ID del padre
+      pending: !navigator.onLine,
+    });
+
+    // 3. Actualizar estado y DB Local
+    setTasks((prev) => [localTask, ...prev]);
+    await putTaskLocal(localTask);
+
+    // 4. Lógica de Sincronización (Outbox u Online)
+    if (!navigator.onLine) {
+      const op: OutboxOp = {
+        id: "op-" + clienteId,
+        op: "create",
+        clienteId,
+        data: localTask,
+        ts: Date.now(),
+      };
+      await queue(op);
+      return;
+    }
+
+    try {
+      // Enviamos el objeto al server incluyendo el parentId
+      const { data } = await api.post("/tasks", localTask);
+      const created = normalizeTask(data?.task ?? data);
+
+      setTasks((prev) => prev.map((x) => (x._id === clienteId ? created : x)));
+      await removeTaskLocal(clienteId);
+      await putTaskLocal(created);
+    } catch {
       const op: OutboxOp = {
         id: "op-" + clienteId,
         op: "create",
@@ -169,7 +323,7 @@ export default function Dashboard() {
 
   async function saveEdit(taskId: string) {
     const newTitle = editingTitle.trim();
-    const newDesc  = editingDescription.trim();
+    const newDesc = editingDescription.trim();
     if (!newTitle) return;
 
     const before = tasks.find((t) => t._id === taskId);
@@ -236,7 +390,7 @@ export default function Dashboard() {
 
   async function removeTask(taskId: string) {
     const backup = tasks;
-    setTasks((prev) => prev.filter((t) => t._id !== taskId));
+    setTasks((prev) => prev.filter((t) => t._id !== taskId && t.parentId !== taskId));
     await removeTaskLocal(taskId);
 
     if (!navigator.onLine) {
@@ -260,25 +414,30 @@ export default function Dashboard() {
     window.location.href = "/"; // login
   }
 
-  const filtered = useMemo(() => {
-    let list = tasks;
-    if (search.trim()) {
-      const s = search.toLowerCase();
-      list = list.filter(
-        (t) =>
-          (t.title || "").toLowerCase().includes(s) ||
-          (t.description || "").toLowerCase().includes(s)
-      );
-    }
-    if (filter === "active") list = list.filter((t) => t.status !== "Completada");
-    if (filter === "completed") list = list.filter((t) => t.status === "Completada");
-    return list;
-  }, [tasks, search, filter]);
+const filtered = useMemo(() => {
+  let list = tasks;
+
+ 
+  if (search.trim()) {
+    const s = search.toLowerCase();
+    list = list.filter(
+      (t) =>
+        (t.title || "").toLowerCase().includes(s) ||
+        (t.description || "").toLowerCase().includes(s)
+    );
+  }
+
+  if (filter === "active") list = list.filter((t) => t.status !== "Completada");
+  if (filter === "completed") list = list.filter((t) => t.status === "Completada");
+
+  return list.filter(t => !t.parentId); 
+}, [tasks, search, filter]);
 
   const stats = useMemo(() => {
     const total = tasks.length;
     const done = tasks.filter((t) => t.status === "Completada").length;
-    return { total, done, pending: total - done };
+    const percentage = total > 0 ? Math.round((done / total) * 100) : 0;
+    return { total, done, pending: total - done, percentage };
   }, [tasks]);
 
   return (
@@ -298,6 +457,27 @@ export default function Dashboard() {
       </header>
 
       <main>
+        {/* ===== Barra de Progreso ===== */}
+        <div className="progress-container" style={{ marginBottom: '20px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '5px', fontSize: '0.9rem' }}>
+            <span>Progreso total</span>
+            <span>{stats.percentage}%</span>
+          </div>
+          <div style={{
+            width: '100%',
+            backgroundColor: '#30363d', // Color de fondo de la barra (oscuro)
+            borderRadius: '8px',
+            height: '10px',
+            overflow: 'hidden'
+          }}>
+            <div style={{
+              width: `${stats.percentage}%`,
+              backgroundColor: stats.percentage === 100 ? '#238636' : '#1f6feb', // Verde si terminó, azul si no
+              height: '100%',
+              transition: 'width 0.4s ease-in-out' // Animación suave
+            }} />
+          </div>
+        </div>
         {/* ===== Crear ===== */}
         <form className="add add-grid" onSubmit={addTask}>
           <input
@@ -355,70 +535,26 @@ export default function Dashboard() {
         ) : (
           <ul className="list">
             {filtered.map((t) => (
-              <li key={t._id} className={t.status === "Completada" ? "item done" : "item"}>
-                {/* Select de estado */}
-                <select
-                  value={t.status}
-                  onChange={(e) => handleStatusChange(t, e.target.value as Status)}
-                  className="status-select"
-                  title="Estado"
-                >
-                  <option value="Pendiente">Pendiente</option>
-                  <option value="En Progreso">En Progreso</option>
-                  <option value="Completada">Completada</option>
-                </select>
-
-                <div className="content">
-                  {editingId === t._id ? (
-                    <>
-                      <input
-                        className="edit"
-                        value={editingTitle}
-                        onChange={(e) => setEditingTitle(e.target.value)}
-                        placeholder="Título"
-                        autoFocus
-                      />
-                      <textarea
-                        className="edit"
-                        value={editingDescription}
-                        onChange={(e) => setEditingDescription(e.target.value)}
-                        placeholder="Descripción"
-                        rows={2}
-                      />
-                    </>
-                  ) : (
-                    <>
-                      <span className="title" onDoubleClick={() => startEdit(t)}>
-                        {t.title}
-                      </span>
-                      {t.description && <p className="desc">{t.description}</p>}
-                      {(t.pending || isLocalId(t._id)) && (
-                        <span
-                          className="badge"
-                          title="Aún no sincronizada"
-                          style={{ background: "#b45309", width: "fit-content" }}
-                        >
-                          Falta sincronizar
-                        </span>
-                      )}
-                    </>
-                  )}
-                </div>
-
-                <div className="actions">
-                  {editingId === t._id ? (
-                    <button className="btn" onClick={() => saveEdit(t._id)}>Guardar</button>
-                  ) : (
-                    <button className="icon" title="Editar" onClick={() => startEdit(t)}>✏️</button>
-                  )}
-                  <button className="icon danger" title="Eliminar" onClick={() => removeTask(t._id)}>
-                    🗑️
-                  </button>
-                </div>
-              </li>
+              <TaskItem
+                key={t._id}
+                task={t}
+                allTasks={tasks} // Ojo: pasamos 'tasks' (todas), no 'filtered'
+                onStatusChange={handleStatusChange}
+                onAddSubtask={addSubtask}
+                onEdit={startEdit}
+                onRemove={removeTask}
+                onSaveEdit={saveEdit}
+                isEditing={editingId === t._id}
+                editState={{ id: editingId, title: editingTitle, description: editingDescription }}
+                setEditState={(s: any) => {
+                  setEditingTitle(s.title);
+                  setEditingDescription(s.description);
+                }}
+              />
             ))}
           </ul>
         )}
+
       </main>
     </div>
   );

@@ -5,6 +5,26 @@
   text-align: center;
 }
 
+.sub-list {
+  list-style: none;
+  margin-left: 20px;
+  padding-left: 15px;
+  border-left: 2px solid #30363d; /* Línea vertical que conecta hijos */
+  margin-top: 5px;
+}
+
+.item {
+  display: flex;
+  flex-direction: column; /* Para que la sub-lista quede abajo del contenido del padre */
+  align-items: stretch;
+}
+
+.item-main-content {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .logo {
   height: 6em;
   padding: 1.5em;
