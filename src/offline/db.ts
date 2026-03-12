@@ -31,17 +31,40 @@ export async function putTaskLocal(task:any){ await (await db()).put("tasks", ta
 export async function getAllTasksLocal(){ return (await (await db()).getAll("tasks")) || []; }
 export async function removeTaskLocal(id:string){ await (await db()).delete("tasks", id); }
 
-/** Promociona una tarea local (clienteId) a serverId y quita pending */
-export async function promoteLocalToServer(clienteId:string, serverId:string){
+export async function promoteLocalToServer(clienteId: string, serverId: string) {
   const d = await db();
   const t = await d.get("tasks", clienteId);
   if (t) {
     await d.delete("tasks", clienteId);
     t._id = serverId;
     t.pending = false;
+    // Si la tarea es una subtarea y su padre ya cambió a serverId, lo actualizamos aquí también
+    const mappedParent = await getMapping(t.parentId);
+    if (mappedParent) t.parentId = mappedParent;
+
     await d.put("tasks", t);
+    
+    // 🔥 CLAVE: Si esta tarea tiene hijos, actualizamos el parentId de esos hijos
+    await updateChildrenParentId(clienteId, serverId);
   }
 }
+
+
+/** * Actualiza las subtareas en IndexedDB que apuntan a un ID temporal
+ */
+async function updateChildrenParentId(oldId: string, newId: string) {
+  const d = await db();
+  const all = await d.getAll("tasks");
+  for (const t of all) {
+    if (t.parentId === oldId) {
+      t.parentId = newId;
+      await d.put("tasks", t);
+    }
+  }
+}
+
+
+
 
 // OUTBOX
 export type OutboxOp =

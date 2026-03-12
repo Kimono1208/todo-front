@@ -6,82 +6,68 @@ import {
   removeTaskLocal, promoteLocalToServer
 } from "./db";
 
-// 👇 Banderita (candado) para evitar que la sincronización se ejecute dos veces al mismo tiempo
 let isSyncing = false;
 
 export async function syncNow() {
-  // Si no hay internet o YA está sincronizando, nos salimos inmediatamente
   if (!navigator.onLine || isSyncing) return;
-
-  isSyncing = true; // 🔒 Ponemos el candado
+  isSyncing = true;
 
   try {
+    // Ordenamos por fecha (ts) para que el padre se cree ANTES que el hijo
     const ops = (await getOutbox() as any[]).sort((a, b) => a.ts - b.ts);
-    
-    if (!ops.length) return; // Si no hay nada que sincronizar, nos salimos
+    if (!ops.length) return;
 
-    // 1. Preparamos las tareas para bulksync (crear/actualizar)
-    const toSync: any[] = [];
     for (const op of ops) {
+      // --- OPERACIÓN: CREATE ---
       if (op.op === "create") {
-        toSync.push({
-          clienteId: op.clienteId,
-          title: op.data.title,
-          description: op.data.description ?? "",
-          status: op.data.status ?? "Pendiente",
-        });
-      } else if (op.op === "update") {
-        const cid = op.clienteId;
-        if (cid) {
-          toSync.push({
-            clienteId: cid,
-            title: op.data.title,
-            description: op.data.description,
-            status: op.data.status,
-          });
-        } else if (op.serverId) {
-          try { await api.put(`/tasks/${op.serverId}`, op.data); } catch {}
-        }
-      }
-    }
-
-    // 2. Ejecutamos bulksync y actualizamos los IDs locales a los del servidor
-    if (toSync.length) {
-      try {
-        const { data } = await api.post("/tasks/bulksync", { tasks: toSync });
-        for (const map of data?.mapping || []) {
-          await setMapping(map.clienteId, map.serverId);
-          await promoteLocalToServer(map.clienteId, map.serverId); // Quita pending y cambia _id
-        }
-      } catch (err) {
-        console.error("Falló el bulksync, abortando limpieza:", err);
+        const payload = { ...op.data };
         
-        return; // 🛑 Salimos para NO borrar el outbox si el servidor falló
+        // Si es una subtarea, verificamos si su parentId ya tiene un ID de servidor
+        if (payload.parentId) {
+          const mappedId = await getMapping(payload.parentId);
+          if (mappedId) payload.parentId = mappedId;
+        }
+
+        try {
+          const { data } = await api.post("/tasks", payload);
+          const serverId = data?.task?._id || data?._id;
+          
+          if (serverId) {
+            await setMapping(op.clienteId, serverId);
+            await promoteLocalToServer(op.clienteId, serverId);
+          }
+        } catch (err) {
+          console.error("Error creando tarea en sync:", err);
+        }
+      }
+
+      // --- OPERACIÓN: UPDATE ---
+      else if (op.op === "update") {
+        // Buscamos el ID real (si era local, usamos el mapping)
+        const realId = op.serverId || (op.clienteId ? await getMapping(op.clienteId) : null);
+        if (!realId) continue;
+
+        try {
+          await api.put(`/tasks/${realId}`, op.data);
+        } catch {}
+      }
+
+      // --- OPERACIÓN: DELETE ---
+      else if (op.op === "delete") {
+        const realId = op.serverId || (op.clienteId ? await getMapping(op.clienteId) : null);
+        if (!realId) continue;
+        
+        try {
+          await api.delete(`/tasks/${realId}`);
+          await removeTaskLocal(op.clienteId || realId);
+        } catch {}
       }
     }
 
-    // 3. Borramos las tareas que se eliminaron en modo offline
-    for (const op of ops) {
-      if (op.op !== "delete") continue;
-      const serverId = op.serverId ?? (op.clienteId ? await getMapping(op.clienteId) : undefined);
-      if (!serverId) continue;
-      try { 
-        await api.delete(`/tasks/${serverId}`); 
-        await removeTaskLocal(op.clienteId || serverId); 
-      } catch {}
-    }
-
-    // 4. Si llegamos hasta aquí, todo fue un éxito. Limpiamos la cola de offline.
+    // Al terminar el bucle, limpiamos el outbox
     await clearOutbox();
 
   } finally {
-    isSyncing = false; // 🔓 Pase lo que pase (éxito o error), quitamos el candado al final para futuras sincronizaciones
+    isSyncing = false;
   }
-}
-
-// Suscripción a online/offline
-export function setupOnlineSync() {
-  const handler = () => { void syncNow(); };
-  window.addEventListener("online", handler);
-  return () => window.removeEventListener("online", handler);
 }
